@@ -1,0 +1,671 @@
+import numpy as np
+import cv2
+import os
+import pandas as pd
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.ensemble import RandomForestClassifier, VotingClassifier, GradientBoostingClassifier
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.svm import SVC
+from sklearn.feature_selection import SelectKBest, f_classif
+import joblib
+from tqdm import tqdm
+from xgboost import XGBClassifier
+import warnings
+warnings.filterwarnings('ignore')
+
+class OptimizedPlantClassifier90:
+    def __init__(self, img_size=(256, 256)):  # 增大图像尺寸获取更多特征
+        self.img_size = img_size
+        self.scaler = StandardScaler()
+        self.label_encoder = LabelEncoder()
+        self.model = None
+        self.feature_selector = None
+        
+    def extract_rich_features(self, img_path):
+        """丰富的特征提取 - 针对植物幼苗优化"""
+        img = cv2.imread(img_path)
+        if img is None:
+            return None
+        
+        img = cv2.resize(img, self.img_size)
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        features = []
+        
+        # 1. 颜色特征（植物分类的关键）
+        features.extend(self._extract_plant_color_features(img_rgb))
+        
+        # 2. 纹理特征
+        features.extend(self._extract_plant_texture_features(img_gray))
+        
+        # 3. 形状特征
+        features.extend(self._extract_plant_shape_features(img_gray))
+        
+        # 4. 叶脉特征（针对植物）
+        features.extend(self._extract_vein_features(img_gray))
+        
+        # 5. 局部特征
+        features.extend(self._extract_local_features(img_gray))
+        
+        return np.array(features)
+    
+    def _extract_plant_color_features(self, img_rgb):
+        """植物专用颜色特征"""
+        features = []
+        
+        # 1. HSV颜色空间（对植物最有效）
+        img_hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
+        
+        # HSV完整直方图
+        for i in range(3):
+            hist = cv2.calcHist([img_hsv], [i], None, [32], [0, 256])
+            hist = cv2.normalize(hist, hist).flatten()
+            features.extend(hist)
+        
+        # 2. 绿色通道特别关注（植物特征）
+        green_channel = img_rgb[:, :, 1].flatten()
+        green_features = [
+            np.mean(green_channel),
+            np.std(green_channel),
+            np.median(green_channel),
+            np.max(green_channel) - np.min(green_channel),
+            np.percentile(green_channel, 25),
+            np.percentile(green_channel, 75),
+            np.sum(green_channel > 150) / len(green_channel)  # 高绿色像素比例
+        ]
+        features.extend(green_features)
+        
+        # 3. 颜色多样性
+        img_lab = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB)
+        for i in range(3):
+            channel = img_lab[:, :, i].flatten()
+            features.append(np.std(channel))  # 颜色变化
+        
+        # 4. 颜色矩（颜色分布）
+        for i in range(3):
+            hist = cv2.calcHist([img_rgb], [i], None, [8], [0, 256])
+            hist = cv2.normalize(hist, hist).flatten()
+            features.extend(hist[:3])  # 前三个矩
+        
+        return features
+    
+    def _extract_plant_texture_features(self, gray_img):
+        """植物专用纹理特征"""
+        features = []
+        
+        # 1. 多尺度LBP（叶纹理）
+        from skimage.feature import local_binary_pattern
+        
+        lbp_features = []
+        for radius in [1, 2, 3]:
+            n_points = 8 * radius
+            lbp = local_binary_pattern(gray_img, n_points, radius, method='uniform')
+            
+            # LBP直方图
+            n_bins = min(10, int(lbp.max() + 1))
+            hist, _ = np.histogram(lbp.ravel(), bins=n_bins, range=(0, n_bins))
+            hist = hist.astype("float") / (hist.sum() + 1e-6)
+            lbp_features.extend(hist)
+        
+        features.extend(lbp_features[:20])  # 取前20个
+        
+        # 2. 灰度共生矩阵（简化版）
+        try:
+            # 缩小图像加速计算
+            small_img = cv2.resize(gray_img, (64, 64))
+            small_img = (small_img / 4).astype(np.uint8)
+            
+            from skimage.feature import graycomatrix, graycoprops
+            glcm = graycomatrix(small_img, distances=[1], angles=[0],
+                               levels=64, symmetric=True, normed=True)
+            
+            props = ['contrast', 'dissimilarity', 'homogeneity', 'energy', 'correlation']
+            for prop in props:
+                feature = graycoprops(glcm, prop)
+                features.extend(feature.flatten())
+        except:
+            features.extend([0] * 5)
+        
+        # 3. 灰度统计
+        gray_flat = gray_img.flatten()
+        stats = [
+            np.mean(gray_flat),
+            np.std(gray_flat),
+            np.median(gray_flat),
+            np.var(gray_flat),
+            np.max(gray_flat),
+            np.min(gray_flat),
+            np.percentile(gray_flat, 10),
+            np.percentile(gray_flat, 90),
+            np.sum(gray_flat > 128) / len(gray_flat)  # 亮像素比例
+        ]
+        features.extend(stats)
+        
+        return features
+    
+    def _extract_plant_shape_features(self, gray_img):
+        """植物专用形状特征"""
+        # 使用自适应阈值更好地提取植物形状
+        binary = cv2.adaptiveThreshold(gray_img, 255, 
+                                      cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                      cv2.THRESH_BINARY_INV, 11, 2)
+        
+        # 形态学操作
+        kernel = np.ones((5, 5), np.uint8)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+        
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if len(contours) == 0:
+            return [0] * 20
+        
+        # 取前3个最大轮廓（可能有多片叶子）
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:3]
+        
+        features = []
+        
+        for i, contour in enumerate(contours):
+            if i >= 2:  # 只取前2个
+                break
+                
+            # 基础形状特征
+            area = cv2.contourArea(contour)
+            perimeter = cv2.arcLength(contour, True)
+            
+            x, y, w, h = cv2.boundingRect(contour)
+            aspect_ratio = float(w) / h if h != 0 else 0
+            
+            # 形状复杂度
+            circularity = (4 * np.pi * area) / (perimeter ** 2) if perimeter != 0 else 0
+            rect_area = w * h
+            rectangularity = area / rect_area if rect_area != 0 else 0
+            
+            # 凸性
+            hull = cv2.convexHull(contour)
+            hull_area = cv2.contourArea(hull)
+            solidity = area / hull_area if hull_area != 0 else 0
+            
+            # 紧凑度
+            compactness = (perimeter ** 2) / (4 * np.pi * area) if area != 0 else 0
+            
+            contour_features = [
+                area, perimeter, aspect_ratio, circularity, 
+                rectangularity, solidity, compactness
+            ]
+            
+            features.extend(contour_features[:5])  # 每个轮廓取5个最重要特征
+        
+        # 填充缺失值
+        while len(features) < 20:
+            features.append(0)
+        
+        return features[:20]
+    
+    def _extract_vein_features(self, gray_img):
+        """叶脉特征"""
+        features = []
+        
+        # 使用更敏感的Canny检测叶脉
+        edges = cv2.Canny(gray_img, 30, 100)
+        
+        # 叶脉密度
+        vein_density = np.sum(edges > 0) / edges.size
+        features.append(vein_density)
+        
+        # 叶脉方向性
+        sobelx = cv2.Sobel(gray_img, cv2.CV_64F, 1, 0, ksize=3)
+        sobely = cv2.Sobel(gray_img, cv2.CV_64F, 0, 1, ksize=3)
+        gradient_direction = np.arctan2(sobely, sobelx) * 180 / np.pi
+        
+        # 方向直方图
+        hist, _ = np.histogram(gradient_direction.flatten(), bins=12, range=(-180, 180))
+        hist = hist.astype("float") / (hist.sum() + 1e-6)
+        features.extend(hist)
+        
+        # 叶脉连通性
+        num_labels, labels = cv2.connectedComponents(edges)
+        features.append(num_labels / edges.size * 1000)  # 连通区域密度
+        
+        return features
+    
+    def _extract_local_features(self, gray_img):
+        """局部特征"""
+        features = []
+        
+        # 图像分块统计
+        h, w = gray_img.shape
+        block_size = 64
+        
+        for i in range(0, h, block_size):
+            for j in range(0, w, block_size):
+                if i + block_size <= h and j + block_size <= w:
+                    block = gray_img[i:i+block_size, j:j+block_size]
+                    if block.size > 0:
+                        features.append(np.mean(block))
+                        features.append(np.std(block))
+        
+        # 取前16个块的特征
+        return features[:16]
+    
+    def prepare_dataset_with_augmentation(self, data_dir, categories=None):
+        """准备数据集并进行有效的数据增强"""
+        if categories is None:
+            categories = [d for d in os.listdir(data_dir) 
+                         if os.path.isdir(os.path.join(data_dir, d))]
+        
+        X_all = []
+        y_all = []
+        
+        print("提取特征并进行在线数据增强...")
+        
+        for category in tqdm(categories, desc="处理类别"):
+            category_dir = os.path.join(data_dir, category)
+            if not os.path.isdir(category_dir):
+                continue
+            
+            image_files = [f for f in os.listdir(category_dir) 
+                          if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+            
+            original_count = len(image_files)
+            target_count = max(200, original_count * 3)  # 目标每类200-600样本
+            
+            for idx, img_file in enumerate(image_files):
+                img_path = os.path.join(category_dir, img_file)
+                
+                # 原始图像特征
+                features = self.extract_rich_features(img_path)
+                if features is not None:
+                    X_all.append(features)
+                    y_all.append(category)
+                
+                # 数据增强：为少数图像生成增强版本
+                if original_count < 100 and idx < min(original_count, 50):
+                    img = cv2.imread(img_path)
+                    if img is not None:
+                        # 生成2个增强版本
+                        for aug_idx in range(2):
+                            augmented_img = self._augment_image(img)
+                            
+                            # 提取增强图像的特征
+                            temp_path = f'temp_aug_{category}_{idx}_{aug_idx}.jpg'
+                            cv2.imwrite(temp_path, augmented_img)
+                            aug_features = self.extract_rich_features(temp_path)
+                            
+                            if aug_features is not None:
+                                X_all.append(aug_features)
+                                y_all.append(category)
+                            
+                            # 清理临时文件
+                            if os.path.exists(temp_path):
+                                os.remove(temp_path)
+            
+            print(f"  类别 {category}: 原始 {original_count} -> 增强后 {len([x for x in y_all if x == category])}")
+        
+        X_all = np.array(X_all)
+        y_all = np.array(y_all)
+        
+        print(f"\n最终数据集: {X_all.shape[0]} 样本, {X_all.shape[1]} 特征")
+        
+        return X_all, y_all
+    
+    def _augment_image(self, img):
+        """图像增强"""
+        augmented = img.copy()
+        h, w = img.shape[:2]
+        
+        # 随机增强组合
+        import random
+        
+        # 1. 随机旋转 (-45°到45°)
+        if random.random() > 0.5:
+            angle = random.uniform(-45, 45)
+            M = cv2.getRotationMatrix2D((w/2, h/2), angle, 1)
+            augmented = cv2.warpAffine(augmented, M, (w, h))
+        
+        # 2. 随机缩放 (0.8到1.2倍)
+        if random.random() > 0.5:
+            scale = random.uniform(0.8, 1.2)
+            augmented = cv2.resize(augmented, None, fx=scale, fy=scale)
+            augmented = cv2.resize(augmented, (w, h))
+        
+        # 3. 随机翻转
+        if random.random() > 0.5:
+            augmented = cv2.flip(augmented, 1)  # 水平翻转
+        
+        # 4. 随机亮度调整
+        if random.random() > 0.5:
+            brightness = random.uniform(0.7, 1.3)
+            augmented = np.clip(augmented.astype(np.float32) * brightness, 0, 255).astype(np.uint8)
+        
+        # 5. 随机对比度调整
+        if random.random() > 0.5:
+            contrast = random.uniform(0.7, 1.3)
+            augmented = np.clip(128 + contrast * (augmented.astype(np.float32) - 128), 0, 255).astype(np.uint8)
+        
+        # 6. 随机添加高斯噪声
+        if random.random() > 0.3:
+            noise = np.random.normal(0, random.uniform(5, 15), augmented.shape).astype(np.uint8)
+            augmented = cv2.add(augmented, noise)
+        
+        return augmented
+    
+    def select_important_features(self, X, y, k=100):
+        """选择重要特征（保留足够特征）"""
+        print(f"原始特征数: {X.shape[1]}")
+        
+        # 使用ANOVA F-value进行特征选择
+        selector = SelectKBest(f_classif, k=min(k, X.shape[1]))
+        X_selected = selector.fit_transform(X, y)
+        
+        # 保存选择器
+        self.feature_selector = selector
+        
+        print(f"选择后特征数: {X_selected.shape[1]}")
+        
+        return X_selected
+    
+    def train_advanced_ensemble(self, X, y):
+        """训练高级集成模型"""
+        # 编码标签
+        y_encoded = self.label_encoder.fit_transform(y)
+        
+        print(f"类别: {self.label_encoder.classes_}")
+        print(f"各类样本数: {np.bincount(y_encoded)}")
+        
+        # 标准化
+        X_scaled = self.scaler.fit_transform(X)
+        
+        # 分割数据（使用分层分割）
+        X_train, X_val, y_train, y_val = train_test_split(
+            X_scaled, y_encoded, test_size=0.2, random_state=42, stratify=y_encoded
+        )
+        
+        print(f"训练集: {X_train.shape[0]}, 验证集: {X_val.shape[0]}")
+        
+        # 定义更多样化的模型
+        print("\n定义模型...")
+        
+        models = [
+            ('xgb1', XGBClassifier(
+                n_estimators=500,
+                max_depth=10,
+                learning_rate=0.01,
+                subsample=0.7,
+                colsample_bytree=0.7,
+                gamma=0.5,
+                reg_alpha=0.5,
+                reg_lambda=1,
+                random_state=42,
+                n_jobs=-1,
+                use_label_encoder=False,
+                eval_metric='mlogloss'
+            )),
+            ('xgb2', XGBClassifier(
+                n_estimators=300,
+                max_depth=8,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                gamma=1,
+                reg_alpha=1,
+                reg_lambda=5,
+                random_state=43,
+                n_jobs=-1,
+                use_label_encoder=False,
+                eval_metric='mlogloss'
+            )),
+            ('rf1', RandomForestClassifier(
+                n_estimators=500,
+                max_depth=25,
+                min_samples_split=5,
+                min_samples_leaf=2,
+                max_features='sqrt',
+                random_state=42,
+                n_jobs=-1,
+                class_weight='balanced'
+            )),
+            ('rf2', RandomForestClassifier(
+                n_estimators=300,
+                max_depth=20,
+                min_samples_split=3,
+                min_samples_leaf=1,
+                max_features='log2',
+                random_state=43,
+                n_jobs=-1,
+                class_weight='balanced'
+            )),
+            ('gb', GradientBoostingClassifier(
+                n_estimators=300,
+                learning_rate=0.05,
+                max_depth=7,
+                subsample=0.8,
+                random_state=42
+            )),
+            ('knn', KNeighborsClassifier(
+                n_neighbors=7,
+                weights='distance',
+                metric='minkowski',
+                p=2,
+                n_jobs=-1
+            ))
+        ]
+        
+        # 交叉验证评估
+        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+        
+        print("\n交叉验证结果:")
+        cv_results = {}
+        for name, model in models:
+            try:
+                scores = cross_val_score(model, X_train, y_train, cv=cv, 
+                                        scoring='accuracy', n_jobs=-1, error_score='raise')
+                cv_results[name] = scores.mean()
+                print(f"{name}: {scores.mean():.4f} (±{scores.std():.4f})")
+            except Exception as e:
+                print(f"{name}: 失败 - {e}")
+                cv_results[name] = 0
+        
+        # 选择最好的3个模型
+        best_models = sorted(cv_results.items(), key=lambda x: x[1], reverse=True)[:4]
+        best_model_names = [name for name, _ in best_models]
+        
+        print(f"\n选择最佳模型: {best_model_names}")
+        
+        # 创建投票集成
+        selected_models = [(name, model) for name, model in models if name in best_model_names]
+        
+        self.model = VotingClassifier(
+            estimators=selected_models,
+            voting='soft',
+            weights=[3, 2, 2, 1],  # 给前两个模型更高权重
+            n_jobs=-1
+        )
+        
+        # 训练集成模型
+        print("\n训练集成模型...")
+        self.model.fit(X_train, y_train)
+        
+        # 评估
+        train_score = self.model.score(X_train, y_train)
+        val_score = self.model.score(X_val, y_val)
+        
+        print(f"\n模型性能:")
+        print(f"训练准确率: {train_score:.4f}")
+        print(f"验证准确率: {val_score:.4f}")
+        
+        # 详细预测分析
+        from sklearn.metrics import classification_report, confusion_matrix
+        
+        y_pred = self.model.predict(X_val)
+        print("\n分类报告:")
+        print(classification_report(y_val, y_pred, target_names=self.label_encoder.classes_))
+        
+        return val_score
+    
+    def predict_test_set(self, test_dir):
+        """预测测试集"""
+        if not os.path.exists(test_dir):
+            print(f"测试目录不存在: {test_dir}")
+            return None
+        
+        test_features = []
+        test_filenames = []
+        
+        test_files = [f for f in os.listdir(test_dir) 
+                     if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+        
+        print(f"找到 {len(test_files)} 个测试图像")
+        
+        for test_file in tqdm(test_files, desc="提取测试特征"):
+            test_path = os.path.join(test_dir, test_file)
+            features = self.extract_rich_features(test_path)
+            
+            if features is not None:
+                # 应用特征选择
+                if self.feature_selector is not None:
+                    features = self.feature_selector.transform(features.reshape(1, -1)).flatten()
+                
+                test_features.append(features)
+                test_filenames.append(test_file)
+        
+        if not test_features:
+            print("没有提取到测试特征")
+            return None
+        
+        X_test = np.array(test_features)
+        
+        # 标准化
+        X_test_scaled = self.scaler.transform(X_test)
+        
+        # 预测
+        y_pred_encoded = self.model.predict(X_test_scaled)
+        predictions = self.label_encoder.inverse_transform(y_pred_encoded)
+        
+        # 创建结果
+        results = pd.DataFrame({
+            'ID': test_filenames,
+            'Category': predictions
+        })
+        
+        return results
+    
+    def save_model(self, path='plant_classifier_90.pkl'):
+        """保存模型"""
+        joblib.dump({
+            'scaler': self.scaler,
+            'label_encoder': self.label_encoder,
+            'model': self.model,
+            'feature_selector': self.feature_selector,
+            'img_size': self.img_size
+        }, path)
+        print(f"模型已保存到 {path}")
+    
+    def load_model(self, path='plant_classifier_90.pkl'):
+        """加载模型"""
+        data = joblib.load(path)
+        self.scaler = data['scaler']
+        self.label_encoder = data['label_encoder']
+        self.model = data['model']
+        self.feature_selector = data['feature_selector']
+        self.img_size = data['img_size']
+        print(f"模型已从 {path} 加载")
+
+def main_90_percent():
+    """主函数 - 目标90%+准确率"""
+    print("=" * 60)
+    print("植物幼苗分类 - 90%+准确率终极版")
+    print("=" * 60)
+    
+    # 初始化分类器
+    classifier = OptimizedPlantClassifier90(img_size=(256, 256))
+    
+    # 1. 准备数据（带增强）
+    TRAIN_DIR = '/kaggle/input/task1-dataset/train'
+    
+    if not os.path.exists(TRAIN_DIR):
+        print(f"训练目录不存在: {TRAIN_DIR}")
+        return
+    
+    print("1. 提取特征和数据增强...")
+    X, y = classifier.prepare_dataset_with_augmentation(TRAIN_DIR)
+    
+    if len(X) == 0:
+        print("没有找到数据！")
+        return
+    
+    # 2. 特征选择（保留足够特征）
+    print("\n2. 特征选择...")
+    X_selected = classifier.select_important_features(X, y, k=100)
+    
+    # 3. 训练高级集成模型
+    print("\n3. 训练高级集成模型...")
+    accuracy = classifier.train_advanced_ensemble(X_selected, y)
+    
+    # 4. 测试集预测
+    TEST_DIR = '/kaggle/input/task1-dataset/test'
+    if os.path.exists(TEST_DIR):
+        print("\n4. 预测测试集...")
+        results = classifier.predict_test_set(TEST_DIR)
+        
+        if results is not None:
+            results.to_csv('plant_classification_90.csv', index=False)
+            print(f"提交文件已保存: plant_classification_90.csv")
+            print(f"预测了 {len(results)} 个样本")
+            
+            # 显示预测分布
+            print("\n预测类别分布:")
+            print(results['Category'].value_counts())
+    
+    # 5. 保存模型
+    classifier.save_model()
+    
+    # 6. 结果评估
+    print(f"\n{'='*60}")
+    print("最终结果")
+    print(f"{'='*60}")
+    print(f"验证准确率: {accuracy:.4f}")
+    
+    if accuracy >= 0.90:
+        print("🎉 恭喜！达到90%+准确率目标！")
+    elif accuracy >= 0.85:
+        print("✅ 接近目标，准确率良好")
+        print("可以尝试以下改进:")
+        print("1. 收集更多训练数据")
+        print("2. 使用预训练的深度学习特征")
+        print("3. 调整模型参数")
+    else:
+        print("⚠️  需要进一步优化")
+    
+    return accuracy
+
+# 运行主程序
+if __name__ == "__main__":
+    accuracy = main_90_percent()
+    
+    # 如果准确率不够，提供进一步建议
+    if accuracy < 0.90:
+        print("\n" + "="*60)
+        print("进一步优化建议:")
+        print("="*60)
+        print("1. 数据层面:")
+        print("   - 确保每类至少有150-200个样本")
+        print("   - 使用更复杂的数据增强（旋转、裁剪、颜色变换）")
+        print("   - 人工检查并清理噪声数据")
+        
+        print("\n2. 特征层面:")
+        print("   - 提取深度学习特征（使用预训练CNN）")
+        print("   - 尝试SIFT、SURF等局部特征")
+        print("   - 使用特征融合技术")
+        
+        print("\n3. 模型层面:")
+        print("   - 尝试深度学习模型（CNN）")
+        print("   - 使用更复杂的集成方法（堆叠、提升）")
+        print("   - 进行更细致的超参数调优")
+        
+        print("\n4. 后处理:")
+        print("   - 使用模型融合")
+        print("   - 应用集成学习")
+        print("   - 使用测试时增强（TTA）")
